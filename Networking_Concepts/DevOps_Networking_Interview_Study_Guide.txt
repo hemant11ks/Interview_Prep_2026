@@ -1,0 +1,1317 @@
+DEVOPS NETWORKING: INTERVIEW STUDY GUIDE
+Fundamentals, architecture, commands, troubleshooting, and interview practice
+Reference check: 17 October 2026
+===============================================================================
+
+HOW TO USE THIS GUIDE
+Read sections 1-8 for foundations, 9-13 for platform knowledge, and 14-18 for
+operational practice. Rehearse section 19 aloud. Finish with section 21.
+
+Interview answer pattern:
+  Define the concept -> explain the packet path -> give an example -> state
+  one failure mode -> explain how you would verify it.
+
+Conventions:
+- Commands target Linux with common utilities installed; flags can vary by OS.
+- Replace sample interfaces, IPs, IDs, namespaces, and resource names.
+- example.com and documentation IP ranges are illustrative targets.
+- Commands are examples, not evidence of tests run against your environment.
+- Inspection commands are read-only unless marked LAB or CHANGE. Network probes
+  send traffic. Run packet captures and load tests only on authorized systems.
+- Cloud features, CNI behavior, controller support, and defaults vary by version.
+- References [R01]-[R26] are official documentation, listed in section 20.
+
+CONTENTS
+01  The complete request path and networking models
+02  Ethernet, IP, IPv6, and addressing
+03  CIDR and subnetting with worked examples
+04  TCP, UDP, ports, and connection lifecycle
+05  Routing, NAT, VPNs, and hybrid networking
+06  DNS and service discovery
+07  HTTP, TLS, certificates, and proxies
+08  Firewalls and network security
+09  Load balancing and availability
+10  AWS VPC architecture and troubleshooting
+11  Docker networking
+12  Kubernetes networking
+13  Kubernetes NetworkPolicy practical example
+14  Linux command reference
+15  A repeatable troubleshooting method
+16  Advanced performance and failure analysis
+17  IaC and CI/CD networking
+18  Hands-on practice labs
+19  Scenario-based interview questions and concise answers
+20  Official references
+21  Final quick revision cheat sheet
+
+===============================================================================
+01. THE COMPLETE REQUEST PATH AND NETWORKING MODELS
+===============================================================================
+
+Q: What happens when a user opens https://app.example.com?
+A: The client resolves the name, selects a destination address and route,
+   establishes transport, negotiates TLS, sends HTTP, and receives a response.
+   Caches and existing connections can skip some work. HTTP/3 uses QUIC over
+   UDP; the familiar HTTP/1.1 and HTTP/2 HTTPS path normally uses TCP.
+
+  Client
+    | DNS lookup -> recursive resolver -> authoritative DNS
+    | TCP + TLS, or QUIC
+    v
+  CDN / edge protection
+    |
+  Load balancer / reverse proxy
+    |
+  Application service -> cache / database / external dependency
+    |
+  Response returns through the applicable connection and routing path
+
+DNS is usually a lookup before the application connection; application traffic
+is not forwarded through the DNS server. A CDN cache hit can avoid the origin.
+A proxy often creates a separate connection to its upstream.
+
+OSI layer                 Practical examples          First checks
+7 Application             HTTP, DNS, application API  curl, dig, logs
+6 Presentation            Encoding, encryption        TLS/certificate checks
+5 Session                 Session management          Session/token behavior
+4 Transport               TCP, UDP                    ss, nc, packet capture
+3 Network                 IPv4, IPv6, ICMP            ip route, ping
+2 Data link               Ethernet, VLAN, MAC         ip neigh, bridge
+1 Physical                Link, cable, radio          ethtool, link counters
+
+The OSI model is a troubleshooting aid. Real protocols do not map perfectly
+onto it. TCP/IP commonly groups these into application, transport, internet,
+and link layers.
+
+Encapsulation:
+  [Ethernet [IP [TCP/UDP [application data]]]]
+
+A switch primarily forwards frames using MAC addresses. A router forwards IP
+packets between networks. A firewall enforces policy. A proxy terminates and
+forwards connections or requests. One appliance may perform several roles.
+
+Key measures:
+- Latency: elapsed delay; RTT measures a round trip.
+- Bandwidth: link capacity; throughput: achieved transfer rate.
+- Goodput: useful application payload rate, excluding overhead/retransmissions.
+- Jitter: variation in delay. Loss: packets that fail to arrive.
+- Availability: successful service access over time, not merely a live NIC.
+
+===============================================================================
+02. ETHERNET, IP, IPV6, AND ADDRESSING
+===============================================================================
+
+IPv4 is 32 bits; IPv6 is 128 bits. A prefix identifies a network portion.
+An IP identifies an interface/address location; a port identifies a transport
+endpoint. A socket is an OS communication endpoint. A TCP connection is
+commonly identified by source IP/port and destination IP/port; flow records
+also include protocol, giving the familiar five-tuple.
+
+Common address ranges:
+  10.0.0.0/8         RFC1918 private IPv4
+  172.16.0.0/12      RFC1918 private IPv4; not all 172.x addresses are private
+  192.168.0.0/16     RFC1918 private IPv4
+  127.0.0.0/8        IPv4 loopback, commonly 127.0.0.1
+  169.254.0.0/16     IPv4 link-local; cloud metadata uses addresses here
+  100.64.0.0/10      Shared address space, distinct from RFC1918
+  0.0.0.0/0         All IPv4 destinations in a route or CIDR rule
+  ::/0              All IPv6 destinations
+  ::1/128           IPv6 loopback
+  fe80::/10         IPv6 link-local; interface scope matters
+  fc00::/7          IPv6 unique-local range; locally generated ULAs use fd00::/8
+  2001:db8::/32     IPv6 documentation examples
+  192.0.2.0/24      One IPv4 documentation range
+
+0.0.0.0 as a server bind address means all local IPv4 interfaces, not a remote
+host. Binding to 127.0.0.1 allows local connections within that network
+namespace only. Binding to :: may or may not also accept IPv4; verify settings.
+
+ARP maps a local IPv4 next-hop address to a MAC address. For a remote subnet,
+the host resolves the gateway's MAC, not the remote server's MAC. IPv6 uses
+Neighbor Discovery through ICMPv6, not ARP, and has no broadcast.
+
+  Host A -> local gateway MAC -> router(s) -> Host B
+            IP destination remains B unless NAT changes it
+
+Ethernet addresses normally change hop by hop across routed links; IP TTL
+(or IPv6 Hop Limit) decreases. A VLAN creates a separate Layer 2 broadcast
+domain; routing is needed between VLANs. VLANs alone are not a complete
+security policy.
+
+DHCP supplies settings such as IP address, gateway, and DNS servers. IPv6 can
+use SLAAC and/or DHCPv6; router advertisements supply default-router details.
+
+Q: Why can IPv4 work while the application fails?
+A: The client may prefer a broken IPv6 path. Compare curl -4 and curl -6,
+   inspect AAAA records, IPv6 routes, and IPv6 firewall rules.
+
+===============================================================================
+03. CIDR AND SUBNETTING WITH WORKED EXAMPLES
+===============================================================================
+
+CIDR /n means n network bits. IPv4 address count = 2^(32-n).
+For a conventional IPv4 broadcast subnet, usable hosts = total minus two
+(network and broadcast). /31 point-to-point links and /32 host routes are
+exceptions. Do not apply the minus-two rule blindly to cloud subnets or IPv6.
+
+Prefix  Mask               Total IPv4 addresses  Conventional usable hosts
+/16     255.255.0.0         65,536                65,534
+/20     255.255.240.0       4,096                 4,094
+/22     255.255.252.0       1,024                 1,022
+/24     255.255.255.0       256                   254
+/25     255.255.255.128     128                   126
+/26     255.255.255.192     64                    62
+/27     255.255.255.224     32                    30
+/28     255.255.255.240     16                    14
+/30     255.255.255.252     4                     2
+/31     255.255.255.254     2                     2 on supported P2P links
+/32     255.255.255.255     1                     One host address/route
+
+Worked example: 192.168.10.77/26
+  Block size: 256 - 192 = 64 in the last octet.
+  Boundaries: .0, .64, .128, .192.
+  77 falls in .64-.127.
+  Network:   192.168.10.64
+  Broadcast: 192.168.10.127
+  Hosts:     192.168.10.65 through 192.168.10.126
+
+Split 10.0.0.0/24 into four equal subnets:
+  Borrow 2 bits: /24 -> /26; each block has 64 addresses.
+  10.0.0.0/26    .0-.63
+  10.0.0.64/26   .64-.127
+  10.0.0.128/26  .128-.191
+  10.0.0.192/26  .192-.255
+
+Worked example: 10.0.18.23/20
+  Third-octet block size: 16.
+  Network 10.0.16.0; broadcast 10.0.31.255; 4,096 total addresses.
+
+Host requirement example:
+  Need 50 conventional IPv4 hosts: /26 gives 62 usable; /27 gives only 30.
+  Need 60 addresses in an ordinary AWS IPv4 subnet: /26 gives 59 available,
+  so choose /25 or larger. AWS normally reserves five addresses per subnet.
+  For 10.0.1.0/24, these are .0, .1, .2, .3, and .255. See [R03].
+
+Verify calculations with Python's standard library:
+  python3 -c 'import ipaddress; n=ipaddress.ip_network("192.168.10.77/26", strict=False); print(n, n.netmask, n.broadcast_address, n.num_addresses)'
+
+Plan non-overlapping space for VPCs, VPN clients, offices, Docker bridges,
+Kubernetes Pods, and Services. Account for growth, failover, and rollout surge.
+Aggregation requires aligned contiguous blocks: 10.0.0.0/24 and 10.0.1.0/24
+combine into 10.0.0.0/23; arbitrary adjacent-looking prefixes may not combine.
+
+===============================================================================
+04. TCP, UDP, PORTS, AND CONNECTION LIFECYCLE
+===============================================================================
+
+TCP provides an ordered byte stream, retransmission, flow control, and
+congestion control. It does not preserve application message boundaries.
+UDP carries datagrams without transport-level delivery or ordering guarantees;
+applications can build reliability above it. QUIC does so over UDP. [R17]
+
+TCP opening, simplified:
+  Client                         Server
+    | -------- SYN ------------> |
+    | <----- SYN + ACK ---------- |
+    | -------- ACK ------------> |
+    | ===== application data === |
+
+FIN closes a direction gracefully; RST aborts a connection. TIME_WAIT handles
+late segments and reliable closure. Many TIME_WAIT sockets do not by themselves
+prove a fault. Persistent CLOSE_WAIT often indicates the local application
+has not closed sockets after the peer closed. [R17]
+
+Flow control protects a receiver; congestion control protects the network.
+A successful handshake proves transport reachability at that moment, not
+successful authentication, HTTP responses, or database queries.
+
+Common defaults (actual deployments may override them):
+  SSH             TCP 22           DNS              UDP and TCP 53
+  HTTP            TCP 80           HTTPS            TCP 443
+  HTTP/3          UDP 443           NTP              UDP 123
+  DHCPv4          UDP 67/68         SMTP relay       TCP 25
+  PostgreSQL      TCP 5432          MySQL            TCP 3306
+  Redis           TCP 6379          Kubernetes API   TCP 6443 commonly
+  etcd            TCP 2379/2380     kubelet API      TCP 10250
+
+Client ports are usually ephemeral, while servers listen on configured ports.
+The ephemeral range varies by OS/configuration:
+  sysctl net.ipv4.ip_local_port_range
+
+Q: Is UDP always faster?
+A: It has less built-in transport machinery, but application design, loss,
+   congestion handling, connection reuse, and path behavior determine results.
+
+Q: Does an open TCP port mean the service is healthy?
+A: No. Test the actual protocol and a meaningful operation.
+
+===============================================================================
+05. ROUTING, NAT, VPNS, AND HYBRID NETWORKING
+===============================================================================
+
+A routing table maps destination prefixes to next hops or interfaces. Among
+eligible routes, longest-prefix match chooses the most specific destination.
+Policy routing can first choose a different table based on source or marks.
+
+Example:
+  10.20.0.0/16 -> VPN
+  10.20.5.0/24 -> peering connection
+  0.0.0.0/0   -> default gateway
+  Destination 10.20.5.9 uses /24, not /16 or /0.
+
+Check the route actually selected:
+  ip route get 10.20.5.9
+  ip rule show
+  ip route show table all
+  ip -6 route show
+
+NAT rewrites addresses; PAT/NAPT also translates ports.
+- SNAT changes the source, often for outbound access.
+- DNAT changes the destination, often for published ports or virtual services.
+- MASQUERADE is a Linux SNAT form that uses the outgoing interface's address.
+- NAT is not encryption, authentication, or a complete firewall policy.
+
+  10.0.2.10:51000 -> NAT 198.51.100.10:62000 -> server:443
+  Reply to NAT:62000 -> tracked mapping -> 10.0.2.10:51000
+
+Return routing matters. A request can reach a server while its response takes
+a broken or asymmetric route. Stateful middleboxes may reject a response they
+cannot associate with a connection.
+
+VPN: encrypted tunnel over another network, with routing and MTU implications.
+Site-to-site VPN links networks; client VPN connects individual clients.
+Split tunnel routes selected destinations through VPN; full tunnel normally
+routes all relevant traffic through it. Check DNS routing as well as IP routes.
+
+BGP exchanges reachability between routing domains and is used in many hybrid
+cloud designs. OSPF is an interior routing protocol. Know advertisements,
+withdrawals, convergence, and route filtering; do not memorize only acronyms.
+
+AWS Direct Connect provides dedicated connectivity; it does not automatically
+mean end-to-end encryption. Add supported encryption where required. [R24] Peering,
+transit routing, and private endpoints solve different connectivity needs.
+
+===============================================================================
+06. DNS AND SERVICE DISCOVERY
+===============================================================================
+
+A stub resolver asks a recursive resolver. On a cache miss, that resolver
+follows delegations from root to TLD to authoritative servers. Records are
+cached according to TTL; negative answers can also be cached. [R16]
+
+  Application -> stub/cache -> recursive resolver
+                                | root: where is .com?
+                                | .com: where is example.com?
+                                + authoritative: answer for app.example.com
+
+Records:
+  A       IPv4 address              AAAA    IPv6 address
+  CNAME   Alias to another name     MX      Mail exchanger
+  NS      Authoritative server     TXT     Text/policy data
+  PTR     Reverse lookup           SRV     Service target and port
+  SOA     Zone authority metadata  CAA     Authorized certificate issuers
+
+A conventional CNAME cannot coexist with other record data at that name;
+provider-specific alias features are different. DNSSEC authenticates DNS
+data; it does not encrypt DNS queries. DoH/DoT encrypt resolver transport.
+
+Useful checks:
+  getent ahosts app.example.com
+  dig app.example.com A
+  dig app.example.com AAAA
+  dig @10.0.0.2 app.example.com A
+  dig +tcp app.example.com
+  dig +trace example.com
+  dig -x 192.0.2.10
+
+getent uses the system's configured name-service path; dig queries DNS and
+may not reflect /etc/hosts or the application's resolver behavior. +trace
+performs iterative lookups and can fail where direct DNS egress is blocked.
+
+Interpretation:
+- NXDOMAIN: queried name does not exist from this resolver's perspective.
+- NOERROR with no requested records: name may exist without that record type.
+- SERVFAIL: resolver could not complete resolution; inspect DNSSEC/upstreams.
+- Timeout: query or response path, resolver overload, or firewall issue.
+
+DNS commonly uses UDP 53, but TCP 53 is also necessary, including fallback
+for truncated answers. Allowing only UDP can create selective failures.
+
+Split-horizon DNS returns different answers by client/view. Compare results
+from the failing workload and a healthy peer. TTL changes do not immediately
+invalidate previously cached data. Application caches can have their own rules.
+
+===============================================================================
+07. HTTP, TLS, CERTIFICATES, AND PROXIES
+===============================================================================
+
+HTTP request: method, target, headers, and optional body. HTTP response: status,
+headers, and optional body. HTTP is stateless; applications add sessions.
+GET is intended to retrieve; PUT replaces a target representation; POST performs
+resource-specific processing. Idempotence concerns intended server effect,
+not identical response codes. [R14]
+
+Status categories and common meanings:
+  2xx success; 3xx redirection; 4xx client-side request issue; 5xx server issue
+  200 OK; 201 created; 204 no content; 301/308 permanent redirect
+  401 missing/invalid authentication; 403 forbidden; 404 not found
+  502 gateway received invalid upstream response
+  503 service unavailable; 504 gateway timed out waiting upstream
+A proxy and an application can each generate errors; identify the emitter. [R14]
+
+HTTP/1.1 supports persistent connections. HTTP/2 multiplexes streams over a
+connection, but TCP loss can stall their delivery. HTTP/3 uses QUIC streams
+over UDP and avoids that particular cross-stream TCP limitation.
+WebSocket upgrades or extended connection mechanisms support bidirectional
+communication; intermediaries need compatible timeout and protocol settings.
+
+TLS provides confidentiality, integrity, and peer authentication. In a typical
+certificate-based TLS 1.3 handshake, peers negotiate parameters, exchange key
+shares, authenticate the server, and derive traffic keys. mTLS also authenticates
+the client. Session resumption reduces repeat work; 0-RTT has replay risks.
+SNI identifies the intended server name; ALPN negotiates application protocols.
+Certificate validation checks trust chain, hostname, and validity. [R15]
+
+Certificate troubleshooting:
+  openssl s_client -connect app.example.com:443 \
+    -servername app.example.com -verify_hostname app.example.com \
+    -verify_return_error </dev/null
+
+  openssl x509 -in server.pem -noout -dates -subject -issuer
+
+Check expiry, Subject Alternative Names, intermediates, CA trust, clock skew,
+and whether a proxy is presenting a different certificate. s_client behavior
+and trust stores depend on the local OpenSSL installation.
+
+Preserve hostname and SNI while testing a chosen backend IP:
+  curl --resolve app.example.com:443:192.0.2.10 \
+    --connect-timeout 3 --max-time 10 https://app.example.com/health
+
+Changing only the HTTP Host header does not necessarily fix TLS SNI or hostname
+validation. curl -k disables certificate verification; it is not a repair.
+
+Forward proxy: acts for clients making outbound requests.
+Reverse proxy: fronts servers and forwards inbound requests.
+TLS termination: decrypt at the proxy. Re-encryption adds TLS to the next hop;
+configure upstream identity validation too. Pass-through leaves TLS termination
+at the backend and limits HTTP-aware routing at that intermediary.
+
+X-Forwarded-For/Forwarded are meaningful only when a trusted proxy supplies or
+sanitizes them. Never trust arbitrary client-provided forwarding headers.
+CORS is browser-enforced cross-origin permission, not a network firewall.
+
+===============================================================================
+08. FIREWALLS AND NETWORK SECURITY
+===============================================================================
+
+Stateful filters track flows; stateless filters evaluate packets independently.
+An allow rule needs the right direction, protocol, destination port, source,
+and enforcement point. Multiple independent controls must all permit a flow.
+
+AWS security groups versus network ACLs [R01, R02]:
+                         Security group          Network ACL
+Scope                    Associated ENIs         Subnet boundary
+State                    Stateful                Stateless
+Rule actions             Allow                   Allow and deny
+Evaluation               Combined allow rules    Lowest matching number first
+Return traffic           Tracked automatically   Explicit rules needed
+
+Security groups do not have explicit deny rules. A referenced security group
+is not a routing link. A custom NACL starts with deny behavior until rules are
+added; the default NACL initially permits traffic. NACLs do not filter traffic
+between interfaces within the same subnet. Route 53 Resolver DNS has special
+filtering limitations; use the appropriate DNS controls rather than assuming
+ordinary SG/NACL rules block it.
+
+Stateless return-path example:
+  Client 10.0.2.10:52000 -> server 10.0.3.20:443
+  Forward destination port: 443. Return destination port: 52000.
+  NACL rules must cover both directions at the involved subnet boundaries.
+  Choose ephemeral ranges for actual clients and middleboxes, not guesses.
+
+Linux inspection:
+  sudo nft list ruleset
+  sudo iptables -S
+  sudo iptables -t nat -S
+  sudo ufw status verbose
+
+Use the firewall manager actually installed. iptables may be an nftables
+compatibility frontend. INPUT handles locally delivered packets; FORWARD
+handles routed packets, including many container paths. Never assume a host
+INPUT policy protects every forwarded container port.
+
+Operational practice:
+- Restrict database access to application identities or approved source ranges.
+- Separate network authorization from application authentication.
+- Protect metadata endpoints from untrusted workloads and SSRF paths.
+- Use managed access paths where suitable instead of public SSH exposure.
+- Log decisions with useful context; avoid recording secrets or payloads.
+- Change one narrow rule, verify the intended flow, and retain rollback access.
+
+===============================================================================
+09. LOAD BALANCING AND AVAILABILITY
+===============================================================================
+
+Layer 4 balancing uses transport/connection information. Layer 7 balancing
+understands application requests and can route by host, path, or headers.
+Connection reuse means even connection distribution may not mean even request
+or CPU distribution.
+
+Algorithms include round-robin, least connections, weighted selection, and
+hash-based affinity. Available algorithms depend on the implementation.
+Sticky sessions can simplify legacy apps but complicate failover and scaling;
+prefer external session state when practical.
+
+  Users -> DNS -> Load balancer
+                     |       |
+                     v       v
+                   App A   App B
+                     \       /
+                      Shared data tier
+
+Health checks should test readiness with bounded cost. A TCP check may pass
+while a dependency is unavailable. A deep check that fails every instance
+because one shared dependency is down can also worsen an outage.
+
+Draining stops new traffic while allowing active work to finish within a
+limit. Coordinate load-balancer deregistration, application shutdown, and
+container termination grace periods. Align idle, connect, request, and
+upstream timeouts rather than increasing all values indiscriminately.
+
+AWS choices [R20]:
+- ALB: application-level HTTP/HTTPS routing, often host/path based.
+- NLB: transport-level workloads, including supported TCP/UDP/TLS patterns.
+- GWLB: distributes traffic through virtual network appliances.
+Use product-specific docs for protocol combinations, quotas, and source-IP
+behavior. An NLB can terminate TLS; Layer 4 does not always mean pass-through.
+
+DNS distribution is affected by caches and client behavior, so it does not
+provide instantaneous failover. CDNs cache content near clients; cache keys,
+private data handling, and invalidation matter as much as TTL.
+
+===============================================================================
+10. AWS VPC ARCHITECTURE AND TROUBLESHOOTING
+===============================================================================
+
+A VPC is regional; each subnet is in one Availability Zone. Route-table
+associations determine subnet routing. Public/private describes connectivity,
+not whether an address numerically belongs to an RFC1918 range. [R04]
+
+Example dual-AZ IPv4 design:
+
+  VPC 10.0.0.0/16
+  +----------------------------+----------------------------+
+  | AZ-a                       | AZ-b                       |
+  | Public 10.0.1.0/24          | Public 10.0.2.0/24          |
+  | ALB node, public NAT-a     | ALB node, public NAT-b     |
+  |             |              |             |              |
+  | App 10.0.11.0/24           | App 10.0.12.0/24           |
+  | private workloads          | private workloads          |
+  |             |              |             |              |
+  | DB 10.0.21.0/24            | DB 10.0.22.0/24            |
+  | no default Internet route  | no default Internet route  |
+  +----------------------------+----------------------------+
+             Public routes: 0.0.0.0/0 -> Internet Gateway
+             App-a default: 0.0.0.0/0 -> NAT-a
+             App-b default: 0.0.0.0/0 -> NAT-b
+
+For direct EC2 IPv4 Internet connectivity, check an IGW route, public IPv4/EIP,
+and security policy. An IGW route alone does not make a private IPv4 address
+Internet-routable. VPC route tables include local reachability; more-specific
+routes can alter forwarding in supported designs. [R04]
+
+A public NAT gateway supports connections initiated from private workloads
+using its public egress address through an IGW; it does not expose a general
+inbound port-forwarding service. A private NAT gateway serves private
+connectivity use cases. NAT gateways do not have security groups. [R05]
+
+The diagram uses zonal NAT gateways, one per AZ, to avoid dependence on another
+AZ's NAT for each app subnet. Regional NAT gateways can automate multi-AZ
+expansion; check regional support and design requirements. [R23]
+NAT cost, processing capacity, connection
+limits, and cross-AZ traffic are architecture considerations. [R05]
+
+IPv6 usually uses direct routing rather than IPv4-style NAT. An egress-only
+Internet gateway supports outbound-initiated IPv6 Internet access. NAT64 with
+DNS64 is a separate IPv6-to-IPv4 access pattern.
+
+Connectivity choices:
+- VPC peering: private VPC-to-VPC connectivity, non-transitive; no overlapping
+  IPv4 CIDRs for peering. A->B and B->C do not automatically give A->C. [R25]
+- Transit Gateway: hub routing across multiple attached networks; inspect
+  attachment associations and route propagation in both directions.
+- Gateway endpoints: S3/DynamoDB access using route-table integration.
+- Interface endpoints: private service access through ENIs and private IPs;
+  inspect endpoint SGs, private DNS, service permissions, and endpoint policy.
+- Route 53 Resolver endpoints/rules: hybrid DNS forwarding, not packet routing.
+
+Read-only investigation examples (set region/profile deliberately):
+  aws sts get-caller-identity
+  aws ec2 describe-route-tables --filters Name=vpc-id,Values=vpc-EXAMPLE
+  aws ec2 describe-security-groups --group-ids sg-EXAMPLE
+  aws ec2 describe-network-acls --filters Name=vpc-id,Values=vpc-EXAMPLE
+  aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=vpc-EXAMPLE
+  aws elbv2 describe-target-health --target-group-arn "$TG_ARN"
+
+Evidence to collect:
+- VPC Flow Logs: flow metadata and ACCEPT/REJECT context, not packet contents.
+  ACCEPT does not prove the application processed a request; not all traffic
+  is represented. Check the logging scope and aggregation interval.
+- Reachability Analyzer: configuration-based path analysis for supported paths;
+  it does not send a real application request or prove service health. [R26]
+- Load-balancer access logs, target health reasons, and application logs.
+- NAT metrics, including port-allocation errors and dropped packets.
+
+Private EC2 cannot download packages: check DNS, selected route, NAT state,
+NAT-subnet IGW route, SG egress, NACL return ports, proxy, and package endpoint.
+Endpoint-specific access may remove the need for NAT for that service.
+
+===============================================================================
+11. DOCKER NETWORKING
+===============================================================================
+
+A network namespace isolates interfaces, routes, and sockets. A veth pair
+connects namespaces; a Linux bridge acts as a software Layer 2 switch.
+
+  Container A namespace -- veth --+
+                                  +-- bridge -- host routing/NAT -- network
+  Container B namespace -- veth --+
+
+User-defined bridge networks provide container-name resolution and isolation
+between separate networks by default. Containers sharing a bridge can contact
+listening container ports without publishing them. Published ports expose
+selected ports through the host. EXPOSE is image metadata, not publication.
+Binding the application only to container loopback prevents normal access
+through the container interface. [R10]
+
+Common drivers/modes:
+- bridge: typical single-host container networking.
+- host: shares host networking where supported; reduces namespace isolation.
+- none: no external network interface connectivity.
+- overlay: multi-host networking, commonly with Swarm.
+- macvlan/ipvlan: integrate with underlay networking using different L2/L3 models.
+Docker Desktop adds a VM/backend layer; Linux host assumptions may not apply.
+See [R22].
+
+LAB: Create a dedicated network and a locally published web container.
+  docker network create devops-net
+  docker run -d --name net-web --network devops-net \
+    -p 127.0.0.1:8080:80 nginx:alpine
+  curl http://127.0.0.1:8080/
+  docker network inspect devops-net
+  docker port net-web
+  docker inspect net-web
+  docker logs net-web
+
+Images may need downloading; use approved pinned digests in production.
+localhost inside a container means that container's network namespace,
+not the host and not another container. Shared-network-namespace setups are
+an exception, as are containers in the same Kubernetes Pod.
+
+Docker manages firewall/NAT rules for bridge networking. With the iptables
+backend, DOCKER-USER is an insertion point for user forwarding policy;
+packets there have already undergone DNAT. nftables backend behavior differs.
+Published ports can bypass assumptions based on ufw's normal INPUT path.
+Inspect the actual backend and packet path before changing rules. [R11, R12]
+
+Cleanup for the named lab resources:
+  docker rm -f net-web
+  docker network rm devops-net
+
+===============================================================================
+12. KUBERNETES NETWORKING
+===============================================================================
+
+A Pod normally has its own IP; containers within that Pod share the network
+namespace and can use localhost to reach each other. Pod IPs are ephemeral.
+The CNI implementation supplies networking; routing, overlays, encryption,
+and policy support depend on the chosen implementation.
+
+An overlay encapsulates traffic across nodes; an underlay routes on the
+underlying network. Encapsulation consumes MTU. Native routing avoids some
+encapsulation overhead but introduces underlay route/IP-management concerns.
+
+Service concepts [R06]:
+- ClusterIP: stable virtual service address inside the cluster.
+- NodePort: exposes a port on eligible node addresses, subject to implementation
+  and configuration; the default allocation range is 30000-32767.
+- LoadBalancer: asks an integration/controller to provision external balancing.
+- ExternalName: returns a DNS alias; does not itself proxy packets.
+- Headless Service: clusterIP: None; discovery can return endpoint addresses.
+- port: Service port; targetPort: backend port; nodePort: node-facing port.
+- Selectors identify Pods; EndpointSlices represent backends and conditions.
+
+Example: Service port 80 -> targetPort 8080 -> application listens on 8080.
+Declaring containerPort: 8080 does not start a listener or open a firewall.
+
+  Client -> external LB -> Ingress/Gateway controller
+                                |
+                            Service :80
+                                |
+                      ready Pod endpoint :8080
+
+The drawing is logical. Some controllers route directly to Pod endpoints,
+bypassing a Service virtual IP in the data path. kube-proxy or a replacement
+such as an eBPF implementation handles Service forwarding; not every cluster
+uses iptables or even runs kube-proxy.
+
+Ingress describes HTTP(S) routing and requires a controller. The Ingress API
+is frozen; Gateway API provides a newer, extensible model with roles and route
+resources. Gateway API also requires supporting implementations; installing
+an object alone does not create a working gateway. [R08]
+
+Service discovery [R07]:
+  api.team-a.svc.cluster.local
+   |     |       |      |
+ name namespace svc  cluster domain (configurable)
+
+Short name api resolves according to the Pod's DNS search list. Cross-namespace
+access commonly uses api.team-a or the full name. A trailing dot makes a DNS
+name absolute. High ndots/search behavior can amplify lookup traffic.
+NodeLocal DNSCache, if installed, changes the DNS packet path.
+
+Readiness controls whether a Pod normally receives Service traffic. Liveness
+restarts unhealthy containers. Startup probes allow slow initialization.
+Readiness is not a promise that every downstream dependency is healthy.
+
+Debugging sequence [R09]:
+  kubectl get pods -n team-a -o wide
+  kubectl get svc api -n team-a -o yaml
+  kubectl get endpointslices -n team-a \
+    -l kubernetes.io/service-name=api -o yaml
+  kubectl describe pod api-pod -n team-a
+  kubectl logs api-pod -n team-a --tail=100
+  kubectl get networkpolicy -n team-a
+  kubectl exec -n team-a client-pod -- cat /etc/resolv.conf
+  kubectl exec -n team-a client-pod -- \
+    curl --connect-timeout 3 --max-time 10 http://api:80/health
+
+curl must exist in the container. Otherwise use an approved debug image/Pod.
+Compare Pod-IP:targetPort, Service-IP:port, and Service DNS from the same source.
+A successful port-forward bypasses important parts of normal networking and
+cannot validate the complete Ingress/Service path.
+
+EKS consideration: depending on AWS VPC CNI configuration, Pod IP allocation
+can consume subnet addresses and ENI capacity. Include rollout surge, node
+capacity, prefix delegation choices, and subnet fragmentation in planning.
+
+===============================================================================
+13. KUBERNETES NETWORKPOLICY PRACTICAL EXAMPLE
+===============================================================================
+
+Standard NetworkPolicy applies Layer 3/4 allow rules to selected Pods. A policy
+requires a network implementation that enforces it. Ingress and egress
+isolation are independent. Policies are additive; there is no ordered deny
+override. When both endpoints are isolated, source egress and destination
+ingress must permit the connection. Reply traffic for allowed connections is
+implicitly allowed. Standard policies do not provide general HTTP-path or
+DNS-name filtering. [R13]
+
+CHANGE/LAB: Save this as backend-ingress.yaml and review before applying.
+It selects app=backend Pods in namespace demo and permits TCP 8080 only from
+app=frontend Pods in that same namespace. It does not restrict backend egress.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-from-frontend
+  namespace: demo
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  kubectl apply -f backend-ingress.yaml
+  kubectl describe networkpolicy backend-from-frontend -n demo
+
+Another policy may permit additional sources. A namespaceSelector and
+podSelector within one peer item are ANDed; separate peer items are ORed.
+If adding egress isolation, allow necessary DNS over UDP and TCP and required
+application dependencies. Confirm actual DNS destinations, especially with
+NodeLocal DNSCache. NAT/policy ordering and host-network behavior are
+implementation-dependent; verify with a permitted and a denied test client.
+
+Cleanup:
+  kubectl delete networkpolicy backend-from-frontend -n demo
+
+===============================================================================
+14. LINUX COMMAND REFERENCE
+===============================================================================
+
+Addresses and link:
+  ip -br addr                  Concise interface addresses
+  ip -s link                   Drops/errors and link counters
+  ip neigh                     ARP/neighbor cache
+  ethtool eth0                 Link details; tool/driver support required
+  bridge link                  Bridge port membership
+
+Routes and namespaces:
+  ip route                     IPv4 routes
+  ip route get 192.0.2.10       Selected route and source address
+  ip -6 route                  IPv6 routes
+  ip rule                      Policy-routing rules
+  ip netns list                Named network namespaces
+  sudo nsenter -t 1234 -n ip route
+                               Inspect PID 1234's network namespace
+
+Sockets and listeners:
+  sudo ss -lntp                Listening TCP sockets with processes
+  sudo ss -lunp                Listening UDP sockets
+  ss -s                       Socket summary
+  ss -ti                      TCP internals for established sockets
+  sudo lsof -nP -iTCP:8080 -sTCP:LISTEN
+                               Which process listens on TCP 8080?
+
+Connectivity and path:
+  ping -c 4 192.0.2.10         ICMP reachability, if allowed
+  nc -vz -w 3 192.0.2.10 443   TCP connect probe; netcat flags vary
+  traceroute 192.0.2.10        Hop discovery, often UDP probes on Linux
+  traceroute -T -p 443 192.0.2.10
+                               TCP-based trace where supported
+  mtr -rw -c 20 192.0.2.10     Repeated path/loss view
+  tracepath 192.0.2.10         Path and possible MTU discovery
+
+Packet capture:
+  sudo tcpdump -ni any -c 100 'host 192.0.2.10 and tcp port 443'
+  sudo tcpdump -ni eth0 -s 0 -c 200 -w capture.pcap 'port 53'
+  tcpdump -nn -r capture.pcap
+
+-n avoids name resolution; -nn also avoids service-name lookup. -i selects
+interface; -c bounds packet count; -s 0 captures full packets. Captures may
+contain sensitive data. HTTPS payloads remain encrypted without session keys.
+Host offload can make captures show apparent checksum errors or large segments
+that were not actually sent on the wire in that form.
+
+DNS and system services:
+  cat /etc/resolv.conf
+  getent hosts app.example.com
+  resolvectl status            On systems using systemd-resolved
+  timedatectl                  Check time synchronization/clock context
+  journalctl -u systemd-resolved --since '15 minutes ago'
+                               Only where this service is used
+
+HTTP timing [R18]:
+  curl -sS -o /dev/null --connect-timeout 3 --max-time 15 \
+    -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} first=%{time_starttransfer} total=%{time_total}\n' \
+    https://app.example.com/health
+
+These times are cumulative from request start, not independent durations.
+For a fresh simple HTTPS connection, subtract connect from appconnect to
+approximate TLS setup time. Reuse, redirects, proxies, and retries complicate
+interpretation. First-byte time includes network and server work.
+
+===============================================================================
+15. A REPEATABLE TROUBLESHOOTING METHOD
+===============================================================================
+
+Start by writing down:
+  source workload + namespace + source IP
+  destination hostname/IP + protocol + port
+  exact error + timestamp + scope + recent change
+
+Then proceed:
+1. Reproduce from the failing source, not only your laptop.
+2. Compare DNS answers with a healthy source. Check A and AAAA separately.
+3. Check route, chosen source IP, and the return path.
+4. Probe the destination transport port with a short timeout.
+5. Verify server listener, bind address, process, and resource health.
+6. Inspect each policy boundary: host, cloud, container, CNI, proxy, mesh.
+7. Validate TLS hostname, chain, time, protocol, and client identity.
+8. Send the real application request; inspect status and dependency behavior.
+9. Correlate logs and capture packets on both sides if still ambiguous.
+10. Apply the smallest evidence-based fix, retest, and document prevention.
+
+  Name resolves?
+    no -> resolver/configuration/DNS path
+    yes -> route and port reachable?
+             no -> listener/routing/filtering/return path
+             yes -> TLS validates?
+                      no -> certificate/SNI/trust/time/protocol
+                      yes -> HTTP/app correct?
+                               no -> proxy/app/auth/dependencies
+                               yes -> compare load and intermittent conditions
+
+Symptoms are clues, not proof:
+- Timeout: drops, missing route, overloaded endpoint, or response-path failure.
+- Connection refused: often no listener or an active reject at some hop.
+- Connection reset: peer or intermediary aborted an established/attempted flow.
+- No route to host: routing failure or some ICMP/firewall rejection conditions.
+- TLS failure: transport may work while trust/identity/protocol negotiation fails.
+- HTTP error: an HTTP-speaking component answered; determine which one.
+
+Capture interpretation:
+  SYN leaves client; absent at server -> inspect intervening path and capture scope.
+  SYN reaches server; no SYN-ACK -> listener, local policy, or resource issue.
+  SYN-ACK leaves server; absent at client -> return path or intervening filtering.
+  Handshake completes; request stalls -> TLS, application, dependency, MTU, or load.
+
+Do not flush firewall rules, restart every component, or widen CIDRs as a first
+diagnostic step. These actions erase evidence and can create new problems.
+
+===============================================================================
+16. ADVANCED PERFORMANCE AND FAILURE ANALYSIS
+===============================================================================
+
+MTU and PMTUD
+MTU limits a packet on a link. Tunnels reduce usable inner-packet size. IPv4
+PMTUD relies on appropriate ICMP feedback when packets cannot be forwarded
+without fragmentation; IPv6 routers do not fragment transit packets and use
+Packet Too Big feedback. Blocking essential ICMP can create black holes.
+
+Symptom: small responses work, large transfers hang.
+  tracepath 192.0.2.10
+  ping -4 -M do -s 1472 -c 3 192.0.2.10
+For ordinary IPv4 ICMP without options, 1472 payload + 8 ICMP + 20 IP = 1500.
+Failure is inconclusive if ICMP is filtered. Binary-search smaller sizes and
+inspect actual path/tunnel settings. TCP MSS limits TCP payload per segment,
+not total IP packet size.
+
+Packet loss and retransmission
+Check endpoint errors, retransmission counters, captures, and application
+latency together. Intermediate MTR loss without downstream/end-to-end loss
+may be ICMP rate limiting, not forwarded-traffic loss. ECMP can show different
+hops for different probes.
+
+Connection tracking and NAT pressure
+Conntrack tables and NAT source-port pools are finite. Symptoms include
+intermittent new-connection failures while existing sessions keep working.
+  sysctl net.netfilter.nf_conntrack_count
+  sysctl net.netfilter.nf_conntrack_max
+  sudo conntrack -S
+These require applicable kernel support/tools. Use pooling, connection reuse,
+capacity planning, and proper timeouts; do not blindly increase every limit.
+NAT port capacity can depend on destination concentration, not only total load.
+
+Ephemeral ports and socket lifecycle
+Many short outbound connections can stress ports and NAT mappings. Distinguish
+TIME_WAIT from leaked CLOSE_WAIT sockets. Inspect per-process descriptors,
+connection pools, and destination patterns before kernel tuning.
+
+Asymmetric routing and reverse-path filtering
+Linux rp_filter can reject traffic whose source fails reverse-path validation;
+strict mode can conflict with legitimate asymmetric routing. Inspect policy
+routes and forwarding design before changing it. [R19]
+  sysctl net.ipv4.conf.all.rp_filter
+  sysctl net.ipv4.conf.eth0.rp_filter
+  sysctl net.ipv4.ip_forward
+
+Bandwidth-delay product
+Required in-flight bytes approximately equal bandwidth(bytes/sec) x RTT(sec).
+At 1 Gbit/s and 100 ms RTT: 125 MB/s x 0.1 = 12.5 MB in flight. Small windows,
+loss, CPU encryption cost, or single-flow constraints can limit throughput.
+
+Authorized performance test (generates load):
+  iperf3 -s                     On a dedicated test server
+  iperf3 -c 10.0.2.20 -t 10      From the test client
+By default iperf3 uses TCP port 5201. A throughput test does not measure real
+application behavior, and multiple streams may hide single-flow bottlenecks.
+
+Retries, backoff, and deadlines
+Retry transient failures with bounded exponential backoff and jitter. Respect
+a total deadline and operation idempotency. Layered retries multiply load:
+three attempts at each of three layers can produce up to 27 backend attempts.
+Circuit breakers and concurrency limits can prevent cascading overload.
+
+Service mesh
+Sidecars or node-level proxies can add identity, mTLS, routing, and telemetry.
+They also add another failure boundary. Inspect proxy configuration, certificate
+rotation, policy, interception, and application-to-proxy traffic separately.
+
+===============================================================================
+17. IAC AND CI/CD NETWORKING
+===============================================================================
+
+Infrastructure as Code should capture address allocation, subnet associations,
+routes, SG/NACL policy, endpoints, DNS records, load-balancer listeners, health
+checks, and Kubernetes networking resources. Treat the dependency graph as
+part of the design, not just the list of resources.
+
+Review workflow:
+  edit -> format/validate -> plan -> policy checks -> review -> apply
+       -> connectivity tests -> monitor -> retain rollback/recovery path
+
+Terraform examples (run in the intended project):
+  terraform fmt -check
+  terraform validate
+  terraform plan -out=tfplan
+
+plan can contact providers and refresh state. Applying the saved plan is a
+CHANGE and needs the deployment workflow's authorization. Protect plan/state
+artifacts: marking values sensitive primarily controls display and does not
+by itself remove secrets from stored state. [R21]
+
+Useful automated checks:
+- CIDRs are valid, aligned, sized for growth, and non-overlapping.
+- Private subnet routes point to the intended egress path.
+- Database ingress is limited to approved sources.
+- IPv6 policy is reviewed along with IPv4 policy.
+- DNS, TLS, and HTTP checks run from the actual runner/workload network.
+- Intended allowed flows succeed AND forbidden flows fail.
+- Load-balancer readiness and draining work during rolling updates.
+
+CI/CD failure points:
+- Runner cannot resolve a private zone or reach a private cluster API.
+- Registry authentication works but image-layer downloads to other hosts fail.
+- Proxy variables or NO_PROXY omit service names/CIDRs; matching varies by tool.
+- TLS interception CA exists on the host but not inside a build container.
+- Runner egress IP changes and breaks external allowlists.
+- Webhook inbound path differs from the runner's outbound deployment path.
+- Artifact/package sources rate-limit requests; retries amplify the problem.
+
+Use temporary credentials and approved private access paths. A private API
+endpoint does not automatically become reachable because CI has cloud IAM
+permissions. Network reachability and authorization are separate requirements.
+
+Bash smoke-test example (read-only probes; curl and dig required):
+  #!/usr/bin/env bash
+  set -euo pipefail
+  dig +time=2 +tries=1 app.example.com A
+  curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 10 \
+    https://app.example.com/health
+
+A successful dig exit code alone is not a complete DNS assertion; inspect
+RCODE/answers for a DNS-specific gate. The curl request checks resolution,
+connection, TLS, and an HTTP response, but does not prove every business flow.
+Avoid automatically following redirects when they would hide a wrong endpoint.
+
+Blue/green and canary releases
+Use weighted traffic where supported; monitor error rate and tail latency.
+DNS-based switches are affected by caches. Rollbacks must account for active
+connections, certificate compatibility, and database schema changes as well
+as route or target updates.
+
+===============================================================================
+18. HANDS-ON PRACTICE LABS
+===============================================================================
+
+LAB A: Prove that a listener's bind address matters
+1. In a disposable Linux environment:
+     python3 -m http.server 8080 --bind 127.0.0.1
+2. In another terminal:
+     ss -lnt
+     curl http://127.0.0.1:8080/
+3. Try the host's non-loopback IP. It should not reach this loopback-only server
+   through that address under an ordinary configuration.
+4. Stop with Ctrl-C. For a controlled comparison, bind to the host's private IP
+   and repeat; inspect policy before allowing other machines to connect.
+Lesson: a correct firewall rule cannot compensate for a wrong bind address.
+
+LAB B: Separate DNS from TLS and routing
+1. Record dig A and AAAA results for an endpoint you own.
+2. Test normally with curl, then use --resolve with one known backend IP.
+3. Keep the original hostname in the URL so SNI/validation remain meaningful.
+4. Compare failures and timing; do not disable verification.
+Lesson: isolate a layer while preserving the rest of the request semantics.
+
+LAB C: Docker reachability
+1. Run the dedicated Docker lab in section 11.
+2. Inspect network membership and the host port mapping.
+3. Compare host localhost:8080 with the container port 80.
+4. Clean up only the named lab resources.
+Lesson: host ports and container ports are separate endpoints.
+
+LAB D: Kubernetes policy
+1. Use a disposable namespace with labeled frontend and backend test Pods.
+2. Verify the backend listens on 8080 and both test clients can reach it.
+3. Apply section 13's policy with the namespace adjusted if necessary.
+4. Confirm a matching frontend succeeds and a differently labeled Pod fails.
+5. Inspect other policies if the denied test still succeeds.
+6. Remove the policy and lab resources you created.
+Lesson: successful YAML application is not proof of policy enforcement.
+
+LAB E: Design exercise
+Allocate a /16 across two AZs with public, app, and database subnets. Explain
+routes for inbound HTTPS, outbound package downloads, and database traffic.
+Add SG policy, NACL return flow requirements, DNS, private endpoints, monitoring,
+and failure handling. State cost and availability tradeoffs explicitly.
+
+===============================================================================
+19. SCENARIO-BASED INTERVIEW QUESTIONS AND CONCISE ANSWERS
+===============================================================================
+
+01. Ping works, but HTTPS fails. What next?
+A: ICMP is a different protocol. Test TCP 443, check the listener and policy,
+   then inspect SNI, certificate validation, and the HTTP response.
+
+02. Ping fails, but the website works. Is the network broken?
+A: Not necessarily. ICMP may be filtered while HTTPS is allowed. Validate the
+   application path rather than using ping as a universal health test.
+
+03. A site works by IP but not by name. What do you suspect?
+A: Compare resolver answers, hosts-file entries, and IPv6. For HTTPS, test with
+   --resolve because a raw IP changes hostname/SNI semantics.
+
+04. Only one office cannot reach the app.
+A: Compare its DNS view, selected route, VPN/proxy, public egress IP, and policy
+   with a healthy office. Capture a timestamped failing flow.
+
+05. Private EC2 cannot access the Internet.
+A: Check DNS, default route to the intended NAT, NAT state/public configuration,
+   NAT-subnet IGW route, and SG/NACL return traffic. Test the actual port.
+
+06. EC2 has a public IPv4 address but SSH times out.
+A: Verify the subnet IGW route, source-restricted SG rule, NACLs, host firewall,
+   sshd listener, and client path. A public address alone is insufficient.
+
+07. An SG allows HTTPS but traffic still fails.
+A: Check all independent boundaries and the listener. SG permission does not
+   override NACLs, host rules, routing, or an application bind mistake.
+
+08. An NACL permits inbound 443. Why do responses fail?
+A: It is stateless. The return packets target client ephemeral ports, which
+   must be permitted in the relevant outbound and other subnet rules.
+
+09. VPC A peers with B and B peers with C. Can A reach C through B?
+A: Not automatically; VPC peering is non-transitive. Use an appropriate transit
+   design and configure routes and security policy in both directions.
+
+10. VPC and corporate CIDRs overlap. Why is that a problem?
+A: Destinations become ambiguous and some connectivity products reject overlap.
+   Prefer renumbering; specialized NAT/proxy designs add operational complexity.
+
+11. A Docker container can reach itself but not another container.
+A: localhost points to its own namespace. Check shared network membership,
+   container DNS name, destination port, listener bind, and policy.
+
+12. Docker EXPOSE 8080 exists, but the host cannot connect.
+A: EXPOSE is metadata. Confirm a real listener and an explicit published-port
+   mapping if host access through a host port is intended.
+
+13. A Kubernetes Service has no usable endpoints.
+A: Inspect selector/Pod-label matches, namespace, readiness, EndpointSlices,
+   and controller events. A Service existing does not imply ready backends.
+
+14. Pod IP works, but Service IP fails.
+A: Check Service port/targetPort, EndpointSlices, and Service forwarding on the
+   failing node. Investigate kube-proxy or its replacement and relevant policy.
+
+15. Service IP works, but the Service name fails.
+A: Test DNS from the same Pod; inspect resolv.conf, namespace search rules,
+   CoreDNS/NodeLocal DNS, DNS endpoints, and UDP/TCP 53 policy.
+
+16. Ingress returns 404 even though the app is healthy.
+A: Identify who emitted the 404. Check host/path matching, IngressClass,
+   controller configuration, rewrites, and the application's expected path.
+
+17. A load balancer returns 502 or 504.
+A: Read its logs and target health reasons. Check upstream protocol, port,
+   TLS, resets, response validity, and timeout/dependency latency. The status
+   alone does not prove a particular root cause.
+
+18. NetworkPolicy is applied, but forbidden traffic still succeeds.
+A: Confirm enforcement support, selected Pods, direction, other additive allow
+   policies, and implementation-specific host/NAT behavior. Test new connections.
+
+19. Egress isolation breaks all application calls.
+A: Check DNS permission first, then each required dependency. Both source
+   egress and destination ingress may need authorization.
+
+20. A certificate works in a browser but fails in CI.
+A: Compare trust stores, chain presentation, hostname/SNI, clock, proxy
+   interception, and client TLS versions inside the actual runner container.
+
+21. A certificate was renewed but clients still see the old one.
+A: Inspect each load-balancer/backend endpoint and SNI path. Check secret
+   reloads, controller reconciliation, and proxies serving stale configuration.
+
+22. Small requests work; uploads stall.
+A: Compare MTU/PMTUD, tunnel overhead, ICMP feedback, request-size limits,
+   proxy buffering, and timeouts. Capture traffic to distinguish hypotheses.
+
+23. New connections fail only during peak load.
+A: Check connection pools, ephemeral ports, NAT allocation, conntrack, accept
+   queues, file descriptors, and server CPU. Existing sessions may remain healthy.
+
+24. One Kubernetes node has intermittent network failures.
+A: Compare CNI state, routes, policy/Service programming, conntrack, MTU, link
+   counters, and node pressure with a healthy node before changing the fleet.
+
+25. A DNS record changed, but some clients use the old address.
+A: Existing resolver/application caches and established connections can retain
+   old behavior. Check original TTLs and the client's actual resolver path.
+
+26. traceroute shows an asterisk. Is that the broken hop?
+A: Not necessarily. The router may suppress/rate-limit probes while forwarding
+   real traffic. Compare downstream reachability and protocol-matched probes.
+
+27. A deployment fails only from a hosted CI runner.
+A: Check private DNS/API reachability, runner egress allowlists, proxy/CA setup,
+   and registry/artifact hosts. IAM access alone does not establish a route.
+
+28. Why does a successful port-forward not prove Ingress works?
+A: It uses a different path and can bypass the normal external load balancer,
+   controller, and Service forwarding path. Test from the real client location.
+
+29. How do you preserve client identity behind a proxy?
+A: Use supported source-IP preservation or trusted forwarding/PROXY protocol
+   mechanisms. Ensure both ends agree and strip untrusted client headers.
+
+30. Would you fix slow requests by increasing timeouts?
+A: First split DNS/connect/TLS/first-byte time and inspect dependencies, loss,
+   saturation, and retries. Increase a timeout only when the intended latency
+   budget and resource behavior justify it.
+
+31. How would you secure a three-tier application?
+A: Expose only the intended entry point, allow app traffic from the entry tier,
+   database traffic from the app tier, and minimal egress. Add TLS, identity,
+   secrets management, logs, and tests of denied paths.
+
+32. Describe your incident response in 45 seconds.
+A: I scope the affected sources and destination tuple, reproduce the failure,
+   and compare a healthy path. I test DNS, routing, transport, TLS, and the
+   application in order, correlating logs and packets. I make a narrow fix,
+   verify recovery and security, then add prevention and monitoring.
+
+===============================================================================
+20. OFFICIAL REFERENCES
+===============================================================================
+
+These links support platform-specific and protocol details. Consult the
+version matching your environment. Examples and diagnostic workflows in this
+guide are original study material, not vendor deployment guarantees.
+
+[R01] AWS security group rules
+https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html
+[R02] AWS network ACLs
+https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html
+[R03] AWS subnet CIDR blocks and reserved addresses
+https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html
+[R04] AWS route-table options
+https://docs.aws.amazon.com/vpc/latest/userguide/route-table-options.html
+[R05] AWS NAT gateways
+https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html
+[R06] Kubernetes Services
+https://kubernetes.io/docs/concepts/services-networking/service/
+[R07] Kubernetes DNS
+https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/
+[R08] Kubernetes Ingress and Gateway API direction
+https://kubernetes.io/docs/concepts/services-networking/ingress/
+[R09] Kubernetes Service debugging
+https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/
+[R10] Docker bridge networking
+https://docs.docker.com/engine/network/drivers/bridge/
+[R11] Docker packet filtering and firewalls
+https://docs.docker.com/engine/network/packet-filtering-firewalls/
+[R12] Docker iptables integration
+https://docs.docker.com/engine/network/firewall-iptables/
+[R13] Kubernetes NetworkPolicy
+https://kubernetes.io/docs/concepts/services-networking/network-policies/
+[R14] HTTP semantics: RFC 9110
+https://www.rfc-editor.org/rfc/rfc9110.html
+[R15] TLS 1.3: RFC 8446
+https://www.rfc-editor.org/rfc/rfc8446
+[R16] DNS concepts: RFC 1034
+https://www.rfc-editor.org/rfc/rfc1034.html
+[R17] TCP: RFC 9293
+https://www.rfc-editor.org/rfc/rfc9293.html
+[R18] curl options and timing variables
+https://curl.se/docs/manpage.html
+[R19] Linux IP sysctl documentation
+https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html
+[R20] AWS Elastic Load Balancing overview
+https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/what-is-load-balancing.html
+[R21] Terraform sensitive data management
+https://developer.hashicorp.com/terraform/language/manage-sensitive-data
+[R22] Docker Desktop networking differences
+https://docs.docker.com/desktop/features/networking/
+[R23] AWS regional NAT gateways
+https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateways-regional.html
+[R24] AWS Direct Connect encryption
+https://docs.aws.amazon.com/directconnect/latest/UserGuide/encryption-in-transit.html
+[R25] AWS VPC peering behavior
+https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-basics.html
+[R26] AWS network monitoring and analysis
+https://docs.aws.amazon.com/vpc/latest/userguide/monitoring.html
+
+===============================================================================
+21. FINAL QUICK REVISION CHEAT SHEET
+===============================================================================
+
+THE PATH
+  DNS -> route -> TCP/QUIC -> TLS -> HTTP -> proxy -> app -> dependency
+  Always examine the return path and test from the failing source.
+
+ONE-LINE DEFINITIONS
+  CIDR: prefix length that determines network size and route specificity.
+  ARP: local IPv4 next-hop IP-to-MAC discovery; IPv6 uses Neighbor Discovery.
+  TCP: reliable ordered byte stream; UDP: datagrams without those guarantees.
+  NAT: address/port translation; not encryption or complete authorization.
+  DNS: names to records; caching and split views affect observed answers.
+  TLS: encryption, integrity, peer authentication; validate hostname and trust.
+  L4 LB: transport-aware; L7 LB: application-request-aware.
+  CNI: supplies container networking integration in Kubernetes.
+  Service: stable discovery/access abstraction over changing endpoints.
+  NetworkPolicy: additive L3/L4 Pod access rules, requiring enforcement support.
+
+NUMBERS TO REMEMBER
+  IPv4 32 bits; IPv6 128 bits.
+  /24 = 256 addresses; /26 = 64; /28 = 16.
+  Ordinary AWS IPv4 subnet availability = total minus 5.
+  Private IPv4: 10/8, 172.16/12, 192.168/16.
+  DNS 53 UDP+TCP; HTTP 80 TCP; HTTPS 443 TCP; HTTP/3 commonly 443 UDP.
+  SSH 22; PostgreSQL 5432; MySQL 3306; Redis 6379; kube API commonly 6443.
+
+FIRST COMMANDS
+  ip -br addr                        Addresses
+  ip route get DEST_IP               Selected route/source
+  getent ahosts HOST                  System name resolution
+  dig HOST A                         DNS answer
+  sudo ss -lntp                      Listener/process
+  nc -vz -w 3 HOST PORT               TCP connection probe
+  curl -v --max-time 10 https://HOST  HTTP/TLS evidence; redact sensitive output
+  sudo tcpdump -ni any 'host IP'      Packet evidence; bound captures in practice
+  kubectl get pods,svc -n NAMESPACE  Workloads and Service overview
+  kubectl get endpointslices -n NAMESPACE
+                                     Backends and readiness conditions
+
+AWS CHECKLIST
+  Correct account/region -> subnet association -> route -> SG -> NACL
+  -> listener -> return path -> logs.
+  Public IPv4 access needs more than an IGW route.
+  Private egress commonly uses NAT or service-specific private endpoints.
+  SG: stateful allow rules. NACL: stateless ordered allow/deny rules.
+  Peering is non-transitive. Private DNS and private routing are separate.
+
+CONTAINER CHECKLIST
+  localhost is namespace-local.
+  Docker EXPOSE does not publish a port.
+  Service port, targetPort, and nodePort are different.
+  Pod Ready and matching selectors matter.
+  Ingress/Gateway needs a controller.
+  Policy YAML alone does not guarantee policy enforcement.
+
+SYMPTOM -> NEXT INVESTIGATION
+  NXDOMAIN       -> spelling, zone/view, search suffix, negative cache
+  Timeout        -> route, filtering, listener overload, return path
+  Refused        -> missing listener or active rejection
+  TLS failure    -> SNI, SAN, chain, CA trust, clock, protocol
+  502/504        -> emitting proxy, upstream health/protocol/latency
+  Large-data hang-> MTU/PMTUD, request limits, buffering, timeout
+  Peak-only fail -> pools, NAT ports, conntrack, queues, resource saturation
+
+INTERVIEW TRAPS
+  Ping success != application success; ping failure != application failure.
+  DNS success != port reachable; port reachable != TLS or app healthy.
+  Public subnet != every resource publicly reachable.
+  NAT != inbound port forwarding; private endpoint != automatic permission.
+  TIME_WAIT != necessarily a leak; CLOSE_WAIT warrants application inspection.
+  Intermediate traceroute loss != necessarily end-to-end packet loss.
+  curl -k != certificate repair; firewall flush != disciplined diagnosis.
+  More retries can worsen an outage; longer timeouts can increase resource use.
+
+BEST CLOSING ANSWER
+  "I identify the exact failing flow, test one layer at a time, correlate both
+  sides, make the smallest supported change, and verify recovery plus policy."
+
+END OF GUIDE
