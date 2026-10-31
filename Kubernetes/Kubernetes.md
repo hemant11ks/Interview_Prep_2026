@@ -1,4 +1,4 @@
-# ☸️ Kubernetes Interview Preparation — DevOps | SRE | Platform Engineering
+ # ☸️ Kubernetes Interview Preparation — DevOps | SRE | Platform Engineering
 
 > **A practical, interview-ready Kubernetes handbook:** architecture, core objects, networking, storage, scheduling, security, troubleshooting, YAML manifests, `kubectl` commands, real-world scenarios, and concise answers.
 >
